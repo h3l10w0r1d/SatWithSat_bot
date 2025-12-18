@@ -238,6 +238,7 @@ def sat_tutor_answer(user_text: str) -> str:
         temperature=TEMPERATURE,
         store=False,
     )
+    print("runned the openai response function") 
     # Python SDK convenience aggregator for text output  [oai_citation:4‡OpenAI Platform](https://platform.openai.com/docs/api-reference/responses/create?lang=python&utm_source=chatgpt.com)
     out = (getattr(resp, "output_text", None) or "").strip()
     return out or "I couldn't generate an answer—try rephrasing the question."
@@ -249,6 +250,7 @@ def send_reply(chat_id: int, text: str, reply_to_message_id: Optional[int] = Non
         "text": text,
         "disable_web_page_preview": True,
     }
+    print("Reply function activated!")
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
 
@@ -316,6 +318,7 @@ def setup_webhook():
       - ?token=...
       - X-Setup-Token: ...
     """
+    print("flask features activated")
     token_qs = (request.args.get("token") or "").strip()
     token_hdr = (request.headers.get("X-Setup-Token") or "").strip()
     if not SETUP_TOKEN or not hmac.compare_digest(token_qs or token_hdr, SETUP_TOKEN):
