@@ -1,101 +1,59 @@
 import os
-import time
 import hmac
-import json
 import logging
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from flask import Flask, request, abort, jsonify
-
 from openai import OpenAI
 
 # -----------------------------
-# Config
+# Env vars (set these on Render)
 # -----------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 
-# Model: pick what you want (example: gpt-5-mini). Keep it configurable.
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini").strip()
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-5-mini").strip()
 
-# Telegram webhook protection:
-# If you set TELEGRAM_WEBHOOK_SECRET, we will:
-# 1) setWebhook(secret_token=TELEGRAM_WEBHOOK_SECRET) during /setup
-# 2) verify header X-Telegram-Bot-Api-Secret-Token on incoming webhook calls
-TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
-
-# /setup endpoint protection:
-SETUP_TOKEN = os.environ.get("SETUP_TOKEN", "").strip()
-
-# How bot decides to respond:
-# - "mention": reply only when bot is @mentioned or message starts with /sat
-# - "all": reply to any text message in allowed chats
-RESPOND_MODE = os.environ.get("RESPOND_MODE", "mention").strip().lower()
-
-# Optional: restrict to specific chats/channels (comma-separated ids: -100..., etc)
-ALLOWED_CHAT_IDS = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
-
-# Teacher style prompt (tune this!)
-TEACHER_STYLE_PROMPT = os.environ.get(
-    "TEACHER_STYLE_PROMPT",
-    """You are an SAT tutor bot.
-Explain like a good teacher, with 20+ years of tutroing SAT math:
-Start with "Hi I am Saten, what questions do you have?"
-You answer like a modern person, you are doing good jokes.
-Your segment is people studying SAT of 16-17 years old age. 
-""",
-).strip()
-
-# Limits / knobs
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "450"))
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.3"))
-
-# Webhook base URL:
-# On Render you'll usually set WEBHOOK_BASE_URL to your service URL (e.g. https://yourservice.onrender.com)
-# We also try RENDER_EXTERNAL_URL if you use it, but don't depend on it.
+# Your Render public URL, e.g. https://sat-telegram-bot.onrender.com
 WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
 
-# Logging
+# Protect /setup endpoint (so strangers can’t reset your webhook)
+SETUP_TOKEN = (os.environ.get("SETUP_TOKEN") or "").strip()
+
+# Optional Telegram webhook secret token (Telegram will include it in a header on every webhook call)
+TELEGRAM_WEBHOOK_SECRET = (os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+
+# Teacher style prompt
+TEACHER_STYLE_PROMPT = (os.environ.get("TEACHER_STYLE_PROMPT") or """
+You are an SAT tutor bot.
+Explain like a good teacher:
+- Start with a 1-sentence plan.
+- Then show step-by-step reasoning in plain language.
+- Keep it friendly and efficient.
+- End with: Final answer, Quick check, Common trap.
+If the question is ambiguous, ask ONE clarifying question.
+Do not claim you are a real human teacher; you are a tutor bot.
+""").strip()
+
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS") or "450")
+TEMPERATURE = float(os.environ.get("TEMPERATURE") or "0.3")
+
+# -----------------------------
+# App setup
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("sat-telegram-bot")
+log = logging.getLogger("sat-dm-bot")
 
 app = Flask(__name__)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
 _cached_bot_username: Optional[str] = None
-_cached_allowed_chat_ids: Optional[set] = None
 
 
 # -----------------------------
-# Helpers
+# Telegram helpers
 # -----------------------------
-def parse_allowed_chat_ids(raw: str) -> Optional[set]:
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    ids = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.add(int(part))
-        except ValueError:
-            pass
-    return ids or None
-
-
-def allowed_chat(chat_id: int) -> bool:
-    global _cached_allowed_chat_ids
-    if _cached_allowed_chat_ids is None:
-        _cached_allowed_chat_ids = parse_allowed_chat_ids(ALLOWED_CHAT_IDS)
-    if _cached_allowed_chat_ids is None:
-        return True
-    return chat_id in _cached_allowed_chat_ids
-
-
 def tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -113,23 +71,41 @@ def get_bot_username() -> str:
     if _cached_bot_username:
         return _cached_bot_username
     me = tg_api("getMe", {})
-    username = (me.get("result", {}) or {}).get("username") or ""
+    username = ((me.get("result") or {}).get("username") or "").strip()
     _cached_bot_username = username
     return username
 
 
-def extract_message(update: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Returns (message_obj, update_type)
-    Handles:
-      - message
-      - channel_post
-      - edited_channel_post
-    """
-    for key in ("message", "channel_post", "edited_channel_post"):
-        if key in update:
-            return update[key], key
-    return None, ""
+def send_reply(chat_id: int, text: str, reply_to_message_id: Optional[int] = None) -> None:
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+    tg_api("sendMessage", payload)
+
+
+def verify_webhook_secret() -> None:
+    if not TELEGRAM_WEBHOOK_SECRET:
+        return
+    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(got, TELEGRAM_WEBHOOK_SECRET):
+        abort(401)
+
+
+# -----------------------------
+# Update parsing
+# -----------------------------
+def extract_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # DM-only: we only care about normal messages (not channel_post, etc.)
+    return update.get("message")
+
+
+def is_private_chat(msg: Dict[str, Any]) -> bool:
+    chat = msg.get("chat") or {}
+    return chat.get("type") == "private"
 
 
 def is_bot_message(msg: Dict[str, Any]) -> bool:
@@ -138,95 +114,49 @@ def is_bot_message(msg: Dict[str, Any]) -> bool:
 
 
 def text_of(msg: Dict[str, Any]) -> str:
-    # Telegram can deliver text in "text" or captions for media
-    t = msg.get("text") or msg.get("caption") or ""
-    return t.strip()
+    return (msg.get("text") or "").strip()
 
 
-def mentioned_bot(msg: Dict[str, Any], bot_username: str) -> bool:
-    entities = msg.get("entities") or []
-    txt = msg.get("text") or ""
-    bot_username = bot_username.lower()
-
-    # Check entities for mention
-    for e in entities:
-        if e.get("type") == "mention":
-            offset = e.get("offset", 0)
-            length = e.get("length", 0)
-            mention_text = txt[offset : offset + length].lower()
-            if mention_text == f"@{bot_username}":
-                return True
-
-    # Also allow direct "@botname" at start even if entities missing
-    return txt.lower().startswith(f"@{bot_username}")
-
-
-def should_respond(msg: Dict[str, Any], update_type: str) -> bool:
+def normalize_command(text: str) -> str:
     """
-    Policy:
-      - Always ignore bot messages
-      - If RESPOND_MODE=all: respond to any text in allowed chats
-      - If RESPOND_MODE=mention: respond only if:
-          - message starts with /sat OR
-          - bot is @mentioned OR
-          - reply-to-bot message
+    Converts '/sat@BotName blah' -> '/sat blah'
     """
-    if is_bot_message(msg):
-        return False
-
-    txt = text_of(msg)
-    if not txt:
-        return False
-
-    chat = msg.get("chat") or {}
-    chat_id = int(chat.get("id"))
-    if not allowed_chat(chat_id):
-        return False
-
-    if RESPOND_MODE == "all":
-        return True
-
-    # mention mode
+    if not text.startswith("/"):
+        return text
     bot_username = get_bot_username()
-
-    if txt.lower().startswith("/sat"):
-        return True
-    if mentioned_bot(msg, bot_username):
-        return True
-
-    reply_to = msg.get("reply_to_message")
-    if reply_to and (reply_to.get("from") or {}).get("is_bot"):
-        return True
-
-    return False
+    if not bot_username:
+        return text
+    return text.replace(f"@{bot_username}", "").strip()
 
 
-def moderation_flagged(user_text: str) -> bool:
+def parse_sat_prompt(text: str) -> Tuple[str, bool]:
     """
-    Uses omni-moderation-latest.  [oai_citation:3‡OpenAI Platform](https://platform.openai.com/docs/api-reference/moderations/create?lang=python&utm_source=chatgpt.com)
+    Returns (prompt, is_command)
+    - If /sat is used, prompt is the remainder
+    - If plain text, prompt is the whole text
     """
-    if not openai_client:
-        return False
-    try:
-        mod = openai_client.moderations.create(
-            model="omni-moderation-latest",
-            input=user_text,
-        )
-        results = getattr(mod, "results", None) or []
-        if results and getattr(results[0], "flagged", False):
-            return True
-    except Exception as e:
-        # If moderation fails, fail open (you can choose fail-closed if you prefer)
-        log.warning(f"Moderation call failed: {e}")
-    return False
+    t = normalize_command(text).strip()
+    lower = t.lower()
+
+    if lower.startswith("/sat"):
+        # Allow: "/sat" (no args) or "/sat 2+2"
+        parts = t.split(maxsplit=1)
+        if len(parts) == 1:
+            return "", True
+        return parts[1].strip(), True
+
+    if lower.startswith("/start") or lower.startswith("/help"):
+        return "", True
+
+    return t, False
 
 
+# -----------------------------
+# OpenAI call
+# -----------------------------
 def sat_tutor_answer(user_text: str) -> str:
     if not openai_client:
-        return "OPENAI_API_KEY is not set on the server."
-
-    if moderation_flagged(user_text):
-        return "I can’t help with that request. Please ask an SAT-related question."
+        return "Server is missing OPENAI_API_KEY."
 
     resp = openai_client.responses.create(
         model=OPENAI_MODEL,
@@ -238,35 +168,9 @@ def sat_tutor_answer(user_text: str) -> str:
         temperature=TEMPERATURE,
         store=False,
     )
-    print("runned the openai response function") 
-    # Python SDK convenience aggregator for text output  [oai_citation:4‡OpenAI Platform](https://platform.openai.com/docs/api-reference/responses/create?lang=python&utm_source=chatgpt.com)
+
     out = (getattr(resp, "output_text", None) or "").strip()
-    return out or "I couldn't generate an answer—try rephrasing the question."
-
-
-def send_reply(chat_id: int, text: str, reply_to_message_id: Optional[int] = None) -> None:
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    print("Reply function activated!")
-    if reply_to_message_id is not None:
-        payload["reply_to_message_id"] = reply_to_message_id
-
-    tg_api("sendMessage", payload)
-
-
-def verify_webhook_secret() -> None:
-    """
-    If TELEGRAM_WEBHOOK_SECRET is set, Telegram will send it in
-    the X-Telegram-Bot-Api-Secret-Token header (when you setWebhook with secret_token).  [oai_citation:5‡core.telegram.org](https://core.telegram.org/bots/api)
-    """
-    if not TELEGRAM_WEBHOOK_SECRET:
-        return
-    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not hmac.compare_digest(got, TELEGRAM_WEBHOOK_SECRET):
-        abort(401)
+    return out or "I couldn't generate an answer. Try rephrasing the question."
 
 
 # -----------------------------
@@ -274,7 +178,7 @@ def verify_webhook_secret() -> None:
 # -----------------------------
 @app.get("/")
 def root():
-    return "SAT Telegram bot is running."
+    return "SAT DM bot is running."
 
 
 @app.get("/health")
@@ -286,13 +190,16 @@ def health():
 def webhook():
     verify_webhook_secret()
 
-    update = request.get_json(force=True, silent=False)
-    msg, update_type = extract_message(update or {})
-
+    update = request.get_json(force=True, silent=False) or {}
+    msg = extract_message(update)
     if not msg:
         return jsonify({"ok": True})
 
-    if not should_respond(msg, update_type):
+    if is_bot_message(msg):
+        return jsonify({"ok": True})
+
+    if not is_private_chat(msg):
+        # DM-only behavior: ignore groups/channels entirely
         return jsonify({"ok": True})
 
     chat = msg.get("chat") or {}
@@ -300,25 +207,54 @@ def webhook():
     message_id = msg.get("message_id")
 
     user_text = text_of(msg)
+    if not user_text:
+        return jsonify({"ok": True})
+
+    normalized = normalize_command(user_text).strip()
+    lower = normalized.lower()
+
+    # Always respond to /start and /help
+    if lower.startswith("/start") or lower.startswith("/help"):
+        send_reply(
+            chat_id,
+            "Hi! Send me an SAT question.\n\n"
+            "Examples:\n"
+            "• Solve: If 3x + 5 = 20, what is x?\n"
+            "• /sat A circle has radius 6. Find area.\n",
+            reply_to_message_id=message_id,
+        )
+        return jsonify({"ok": True})
+
+    prompt, is_command = parse_sat_prompt(user_text)
+
+    # If user typed "/sat" with nothing else
+    if is_command and (normalized.lower().startswith("/sat")) and not prompt:
+        send_reply(
+            chat_id,
+            "Send the question after /sat.\nExample: /sat If 3x+5=20, find x.",
+            reply_to_message_id=message_id,
+        )
+        return jsonify({"ok": True})
+
+    # DM-only: any non-command text becomes a question
+    question = prompt if prompt else user_text
 
     try:
-        answer = sat_tutor_answer(user_text)
+        answer = sat_tutor_answer(question)
         send_reply(chat_id, answer, reply_to_message_id=message_id)
     except Exception as e:
-        log.exception(f"Failed to handle update: {e}")
-        # Don't break Telegram retries forever; acknowledge receipt.
+        log.exception(f"Failed to answer: {e}")
+        send_reply(chat_id, "Something went wrong on the server. Try again in a moment.", reply_to_message_id=message_id)
+
     return jsonify({"ok": True})
 
 
 @app.post("/setup")
 def setup_webhook():
     """
-    Sets Telegram webhook to: {WEBHOOK_BASE_URL}/webhook
-    Protected by SETUP_TOKEN in query string or header:
-      - ?token=...
-      - X-Setup-Token: ...
+    One-time webhook setup:
+      POST https://YOUR-SERVICE.onrender.com/setup?token=SETUP_TOKEN
     """
-    print("flask features activated")
     token_qs = (request.args.get("token") or "").strip()
     token_hdr = (request.headers.get("X-Setup-Token") or "").strip()
     if not SETUP_TOKEN or not hmac.compare_digest(token_qs or token_hdr, SETUP_TOKEN):
@@ -332,10 +268,11 @@ def setup_webhook():
     payload: Dict[str, Any] = {
         "url": webhook_url,
         "drop_pending_updates": True,
-        "allowed_updates": ["message", "channel_post", "edited_channel_post"],
+        # DM-only: only request message updates
+        "allowed_updates": ["message"],
     }
     if TELEGRAM_WEBHOOK_SECRET:
-        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET  #  [oai_citation:6‡core.telegram.org](https://core.telegram.org/bots/api)
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
 
     try:
         res = tg_api("setWebhook", payload)
@@ -345,6 +282,6 @@ def setup_webhook():
 
 
 if __name__ == "__main__":
-    # Local dev only. On Render use gunicorn.
+    # Local dev only. On Render, use gunicorn.
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
