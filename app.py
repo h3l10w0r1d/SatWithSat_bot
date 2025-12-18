@@ -355,9 +355,10 @@ def help_text() -> str:
         "Help Desk:\n\n"
         "• 📝 Record Test Score — add your SAT score\n"
         "• 📊 My Stats — total points + tests written\n"
-        "• 🏆 Daily Leaderboard — points earned today\n"
-        "• 🏆 Lifetime Leaderboard — all-time points\n\n"
-        "Tip: Type /start anytime to show the menu."
+        "• 🏆 Daily Leaderboard — Leaderboard of all points earned today\n"
+        "• 🏆 Lifetime Leaderboard — Leaderboard of all-time points\n\n"
+        "Tip: Type /start anytime to show the menu.\n\n"
+        "For AI Sat mode,type command /sat and ask your question near it."
     )
 
 
@@ -453,7 +454,7 @@ def webhook():
             return jsonify({"ok": True})
         try:
             score = int(text)
-            if score < 0 or score > 1600:
+            if score < 0 or score > 44:
                 raise ValueError("out of range")
         except Exception:
             send_message(chat_id, "Please enter a number between 0 and 1600 (or /cancel).")
@@ -476,7 +477,7 @@ def webhook():
 
     if text == "📝 Record Test Score":
         set_user_state(user.id, "awaiting_score")
-        send_message(chat_id, "Send your SAT score (0–1600). Type /cancel to stop.")
+        send_message(chat_id, "Send your SAT score (0–44). Type /cancel to stop.")
         return jsonify({"ok": True})
 
     if text == "📊 My Stats":
