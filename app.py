@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 import psycopg
@@ -24,11 +24,10 @@ TELEGRAM_WEBHOOK_SECRET = (os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").stri
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 TIMEZONE_NAME = (os.environ.get("TIMEZONE") or "UTC").strip()  # e.g. "Asia/Yerevan"
 
-# Optional: keep your SAT AI tutor from earlier (can be empty)
+# Optional AI tutor (leave OPENAI_API_KEY empty to disable)
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-# Bot messages
 THINKING_TEXT = "Wait a couple of seconds, I am thinking 🤔"
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
@@ -37,15 +36,17 @@ log = logging.getLogger("sat-helpdesk-bot")
 
 app = Flask(__name__)
 
-# Lazy import for OpenAI (optional)
+# Optional OpenAI client
 openai_client = None
+_openai_rate_limit_error = None
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
-        import openai as openai_errors
+        import openai as openai_pkg
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        _openai_rate_limit_error = getattr(openai_pkg, "RateLimitError", None)
     except Exception as e:
-        log.warning(f"OpenAI init failed (AI tutor disabled): {e}")
+        log.warning(f"OpenAI init failed (AI disabled): {e}")
         openai_client = None
 
 
@@ -151,13 +152,18 @@ def init_db() -> None:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tests_user_created ON tests(user_id, created_at);")
         conn.commit()
 
-@app.before_first_request
-def _startup():
-    try:
-        init_db()
-        log.info("DB initialized")
-    except Exception as e:
-        log.exception(f"DB init failed: {e}")
+# Flask 3 compatible: init once when first request arrives
+_db_inited = False
+
+@app.before_request
+def _ensure_db_initialized():
+    global _db_inited
+    if _db_inited:
+        return
+    init_db()
+    _db_inited = True
+    log.info("DB initialized")
+
 
 @dataclass
 class User:
@@ -216,10 +222,7 @@ def set_user_field(user_id: int, field: str, value: str) -> None:
 def finalize_registration(user_id: int) -> None:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET registered_at=now(), reg_step=0 WHERE id=%s",
-                (user_id,),
-            )
+            cur.execute("UPDATE users SET registered_at=now(), reg_step=0 WHERE id=%s", (user_id,))
         conn.commit()
 
 def add_test_score(user_id: int, score: int) -> None:
@@ -237,23 +240,16 @@ def fetch_user_stats(user_id: int) -> Dict[str, Any]:
         with conn.cursor() as cur:
             cur.execute("SELECT total_points, tests_count FROM users WHERE id=%s", (user_id,))
             u = cur.fetchone()
-            cur.execute("SELECT COUNT(*) AS c FROM tests WHERE user_id=%s", (user_id,))
-            t = cur.fetchone()
-    return {
-        "total_points": int(u["total_points"]),
-        "tests_count": int(u["tests_count"]),
-        "tests_rows": int(t["c"]),
-    }
+    return {"total_points": int(u["total_points"]), "tests_count": int(u["tests_count"])}
 
 def tz_bounds_for_today() -> Tuple[datetime, datetime]:
     tz = ZoneInfo(TIMEZONE_NAME)
     now_local = datetime.now(tz=tz)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
-    # convert to UTC for DB comparison (DB stores timestamptz)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
-def daily_leaderboard(limit: int = 10) -> list[Dict[str, Any]]:
+def daily_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
     start_utc, end_utc = tz_bounds_for_today()
     with db() as conn:
         with conn.cursor() as cur:
@@ -273,7 +269,7 @@ def daily_leaderboard(limit: int = 10) -> list[Dict[str, Any]]:
             )
             return list(cur.fetchall())
 
-def lifetime_leaderboard(limit: int = 10) -> list[Dict[str, Any]]:
+def lifetime_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -303,7 +299,6 @@ def registration_prompt(step: int) -> str:
     }.get(step, "Registration step error.")
 
 def handle_registration(user: User, chat_id: int, incoming: str) -> None:
-    # If user just started (no answer yet), ask question
     if user.reg_step in (1, 2, 3, 4) and not incoming:
         send_message(chat_id, registration_prompt(user.reg_step), reply_markup=remove_keyboard())
         return
@@ -341,7 +336,7 @@ def handle_registration(user: User, chat_id: int, incoming: str) -> None:
         )
         return
 
-def format_lb(rows: list[Dict[str, Any]], title: str) -> str:
+def format_lb(rows: List[Dict[str, Any]], title: str) -> str:
     if not rows:
         return f"{title}\n\nNo results yet."
     lines = [title, ""]
@@ -356,21 +351,21 @@ def format_lb(rows: list[Dict[str, Any]], title: str) -> str:
 
 def help_text() -> str:
     return (
-        "Help Desk commands:\n\n"
-        "• 📝 Record Test Score — add your SAT test score\n"
+        "Help Desk:\n\n"
+        "• 📝 Record Test Score — add your SAT score\n"
         "• 📊 My Stats — total points + tests written\n"
         "• 🏆 Daily Leaderboard — points earned today\n"
         "• 🏆 Lifetime Leaderboard — all-time points\n\n"
-        "Tip: You can always type /start to see the menu."
+        "Tip: Type /start anytime to show the menu."
     )
 
 
 # -----------------------------
-# Optional AI tutor (if you want it)
+# Optional AI tutor (if enabled)
 # -----------------------------
 def ai_answer(question: str) -> str:
     if not openai_client:
-        return "AI tutor is not enabled (missing OPENAI_API_KEY)."
+        return "AI tutor is disabled."
     resp = openai_client.responses.create(
         model=OPENAI_MODEL,
         input=[
@@ -425,6 +420,7 @@ def webhook():
     msg = extract_message(update)
     if not msg:
         return jsonify({"ok": True})
+
     if not is_private_chat(msg) or (msg.get("from") or {}).get("is_bot"):
         return jsonify({"ok": True})
 
@@ -432,10 +428,9 @@ def webhook():
     telegram_id = int((msg.get("from") or {}).get("id"))
     incoming = text_or_caption(msg)
 
-    # Ensure user exists
     user = get_or_create_user(telegram_id, chat_id)
 
-    # /start always shows either registration or menu
+    # /start shows registration or menu
     if incoming.lower().startswith("/start"):
         if user.reg_step != 0 or user.registered_at is None:
             handle_registration(user, chat_id, "")
@@ -443,12 +438,12 @@ def webhook():
             send_message(chat_id, "Welcome back. Choose an option:", reply_markup=main_menu_keyboard())
         return jsonify({"ok": True})
 
-    # If in registration flow, consume messages as registration answers
+    # Registration flow consumes messages
     if user.reg_step != 0 or user.registered_at is None:
         handle_registration(user, chat_id, incoming)
         return jsonify({"ok": True})
 
-    # Handle state: awaiting score input
+    # State: awaiting score
     if user.state == "awaiting_score":
         text = incoming.strip()
         if text.lower() in ("/cancel", "cancel"):
@@ -475,7 +470,7 @@ def webhook():
         )
         return jsonify({"ok": True})
 
-    # Menu actions (buttons are just text messages)
+    # Menu actions
     text = incoming.strip()
 
     if text == "📝 Record Test Score":
@@ -487,17 +482,14 @@ def webhook():
         stats = fetch_user_stats(user.id)
         send_message(
             chat_id,
-            f"📊 My Stats\n\n"
-            f"Total points: {stats['total_points']}\n"
-            f"Tests written: {stats['tests_count']}",
+            f"📊 My Stats\n\nTotal points: {stats['total_points']}\nTests written: {stats['tests_count']}",
             reply_markup=main_menu_keyboard(),
         )
         return jsonify({"ok": True})
 
     if text == "🏆 Daily Leaderboard":
         rows = daily_leaderboard(10)
-        start_utc, _ = tz_bounds_for_today()
-        send_message(chat_id, format_lb(rows, f"🏆 Daily Leaderboard ({TIMEZONE_NAME})\nDay starts at {start_utc.astimezone(ZoneInfo(TIMEZONE_NAME)).strftime('%H:%M')}"), reply_markup=main_menu_keyboard())
+        send_message(chat_id, format_lb(rows, f"🏆 Daily Leaderboard ({TIMEZONE_NAME})"), reply_markup=main_menu_keyboard())
         return jsonify({"ok": True})
 
     if text == "🏆 Lifetime Leaderboard":
@@ -509,8 +501,7 @@ def webhook():
         send_message(chat_id, help_text(), reply_markup=main_menu_keyboard())
         return jsonify({"ok": True})
 
-    # Optional: treat any other message as an SAT question to the AI tutor
-    # If you don't want AI at all, delete this block.
+    # Optional: AI tutor for any other message
     if openai_client:
         thinking_id = send_message(chat_id, THINKING_TEXT)
         try:
@@ -518,7 +509,7 @@ def webhook():
             send_message(chat_id, answer, reply_markup=main_menu_keyboard())
         except Exception as e:
             log.exception(f"[{req_id}] AI error: {e}")
-            send_message(chat_id, f"⚠️ AI error. Check API quota/billing. (req {req_id})", reply_markup=main_menu_keyboard())
+            send_message(chat_id, f"⚠️ AI error (req {req_id}). Check OpenAI quota/billing.", reply_markup=main_menu_keyboard())
         finally:
             delete_message(chat_id, thinking_id)
     else:
