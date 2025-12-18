@@ -179,6 +179,7 @@ class User:
     state: Optional[str]
     total_points: int
     tests_count: int
+    created_at: datetime
 
 def get_or_create_user(telegram_id: int, chat_id: int) -> User:
     with db() as conn:
