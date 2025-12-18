@@ -124,22 +124,36 @@ def text_or_caption(msg: Dict[str, Any]) -> str:
     # IMPORTANT: photos come as caption, not text
     return (msg.get("text") or msg.get("caption") or "").strip()
 
-def sat_tutor_answer(user_text: str) -> str:
+ddef sat_tutor_answer(user_text: str) -> str:
     if not openai_client:
-        return "Server is missing OPENAI_API_KEY (set it in Render env vars)."
+        return "Server is missing OPENAI_API_KEY."
 
-    resp = openai_client.responses.create(
+    # Newer SDKs: Responses API
+    if hasattr(openai_client, "responses"):
+        resp = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": TEACHER_STYLE_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            temperature=TEMPERATURE,
+            store=False,
+        )
+        out = (getattr(resp, "output_text", None) or "").strip()
+        return out or "No output from model."
+
+    # Older SDKs: Chat Completions API (supported indefinitely)
+    resp = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
-        input=[
+        messages=[
             {"role": "system", "content": TEACHER_STYLE_PROMPT},
             {"role": "user", "content": user_text},
         ],
-        max_output_tokens=MAX_OUTPUT_TOKENS,
+        max_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
-        store=False,
     )
-    out = (getattr(resp, "output_text", None) or "").strip()
-    return out or "I couldn't generate an answer. Try rephrasing the question."
+    return (resp.choices[0].message.content or "").strip() or "No output from model."
 
 
 # -----------------------------
