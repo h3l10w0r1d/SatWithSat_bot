@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: sat-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5-mini
+      - key: RESPOND_MODE
+        value: mention
+      - key: MAX_OUTPUT_TOKENS
+        value: "450"
+      - key: TEMPERATURE
+        value: "0.3"
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: SETUP_TOKEN
+        sync: false
+      - key: ALLOWED_CHAT_IDS
+        sync: false
