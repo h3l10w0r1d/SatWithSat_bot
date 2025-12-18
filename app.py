@@ -1,77 +1,57 @@
 import os
+import re
 import hmac
-import time
 import uuid
 import logging
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, Optional, Tuple
 
 import requests
+import psycopg
+from psycopg.rows import dict_row
 from flask import Flask, request, abort, jsonify
-from openai import OpenAI
 
 # -----------------------------
-# Env vars
+# Config (Render env vars)
 # -----------------------------
 TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
-
-# Set this to a model you actually have access to.
-# Good default for many accounts: gpt-4o-mini
-OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
-
 WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
 SETUP_TOKEN = (os.environ.get("SETUP_TOKEN") or "").strip()
-
 TELEGRAM_WEBHOOK_SECRET = (os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
-DEBUG_ENABLED = (os.environ.get("DEBUG_ENABLED") or "1").strip() == "1"
-DEBUG_TOKEN = (os.environ.get("DEBUG_TOKEN") or "").strip()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+TIMEZONE_NAME = (os.environ.get("TIMEZONE") or "UTC").strip()  # e.g. "Asia/Yerevan"
 
-TEACHER_STYLE_PROMPT = (os.environ.get("TEACHER_STYLE_PROMPT") or """
-You are an SAT tutor bot.
-Explain like a good teacher:
-- Start with a 1-sentence plan.
-- Then show step-by-step reasoning in plain language.
-- Keep it friendly and efficient.
-- End with: Final answer, Quick check, Common trap.
-If the question is ambiguous, ask ONE clarifying question.
-Do not claim you are a real human teacher; you are a tutor bot.
-""").strip()
+# Optional: keep your SAT AI tutor from earlier (can be empty)
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS") or "450")
-TEMPERATURE = float(os.environ.get("TEMPERATURE") or "0.3")
+# Bot messages
+THINKING_TEXT = "Wait a couple of seconds, I am thinking 🤔"
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
-# -----------------------------
-# Logging / app
-# -----------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sat-dm-bot")
+log = logging.getLogger("sat-helpdesk-bot")
 
 app = Flask(__name__)
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# In-memory debug state (resets on restart)
-LAST_UPDATE: Optional[Dict[str, Any]] = None
-LAST_UPDATE_AT: Optional[float] = None
-LAST_ERROR: Optional[Dict[str, Any]] = None
-LAST_ERROR_AT: Optional[float] = None
+# Lazy import for OpenAI (optional)
+openai_client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        import openai as openai_errors
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        log.warning(f"OpenAI init failed (AI tutor disabled): {e}")
+        openai_client = None
 
 
 # -----------------------------
-# Helpers
+# Telegram helpers
 # -----------------------------
-def require_setup_auth() -> None:
-    token = (request.args.get("token") or request.headers.get("X-Setup-Token") or "").strip()
-    if not SETUP_TOKEN or not hmac.compare_digest(token, SETUP_TOKEN):
-        abort(401)
-
-def require_debug_auth() -> None:
-    if not DEBUG_ENABLED:
-        abort(404)
-    token = (request.args.get("token") or request.headers.get("X-Debug-Token") or "").strip()
-    if not DEBUG_TOKEN or not hmac.compare_digest(token, DEBUG_TOKEN):
-        abort(401)
-
 def verify_webhook_secret() -> None:
     if not TELEGRAM_WEBHOOK_SECRET:
         return
@@ -90,26 +70,36 @@ def tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(f"Telegram API error: {data}")
     return data
 
-def tg_get(method: str) -> Dict[str, Any]:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    r = requests.get(url, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data
-
-def send_reply(chat_id: int, text: str, reply_to_message_id: Optional[int] = None) -> None:
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> int:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
     }
-    if reply_to_message_id is not None:
-        payload["reply_to_message_id"] = reply_to_message_id
-    tg_api("sendMessage", payload)
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    res = tg_api("sendMessage", payload)
+    return int((res.get("result") or {}).get("message_id"))
+
+def delete_message(chat_id: int, message_id: int) -> None:
+    try:
+        tg_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    except Exception as e:
+        log.info(f"deleteMessage ignored: {e}")
+
+def remove_keyboard() -> Dict[str, Any]:
+    return {"remove_keyboard": True}
+
+def main_menu_keyboard() -> Dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": "📝 Record Test Score"}, {"text": "📊 My Stats"}],
+            [{"text": "🏆 Daily Leaderboard"}, {"text": "🏆 Lifetime Leaderboard"}],
+            [{"text": "❓ Help"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
 
 def extract_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return update.get("message")
@@ -117,43 +107,281 @@ def extract_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def is_private_chat(msg: Dict[str, Any]) -> bool:
     return (msg.get("chat") or {}).get("type") == "private"
 
-def is_bot_message(msg: Dict[str, Any]) -> bool:
-    return bool((msg.get("from") or {}).get("is_bot"))
-
 def text_or_caption(msg: Dict[str, Any]) -> str:
-    # IMPORTANT: photos come as caption, not text
     return (msg.get("text") or msg.get("caption") or "").strip()
 
-def sat_tutor_answer(user_text: str) -> str:
-    if not openai_client:
-        return "Server is missing OPENAI_API_KEY."
 
-    # Newer SDKs: Responses API
-    if hasattr(openai_client, "responses"):
-        resp = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": TEACHER_STYLE_PROMPT},
-                {"role": "user", "content": user_text},
-            ],
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            temperature=TEMPERATURE,
-            store=False,
+# -----------------------------
+# DB helpers
+# -----------------------------
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL (create Render Postgres and set DATABASE_URL).")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+def init_db() -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+              id SERIAL PRIMARY KEY,
+              telegram_id BIGINT UNIQUE NOT NULL,
+              chat_id BIGINT NOT NULL,
+              first_name TEXT,
+              surname TEXT,
+              nickname TEXT,
+              email TEXT,
+              registered_at TIMESTAMPTZ,
+              reg_step SMALLINT NOT NULL DEFAULT 1,  -- 1..4 during registration, 0 = registered
+              state TEXT,                            -- e.g. 'awaiting_score'
+              total_points BIGINT NOT NULL DEFAULT 0,
+              tests_count INTEGER NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS tests (
+              id SERIAL PRIMARY KEY,
+              user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              score INTEGER NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tests_created_at ON tests(created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tests_user_created ON tests(user_id, created_at);")
+        conn.commit()
+
+@app.before_first_request
+def _startup():
+    try:
+        init_db()
+        log.info("DB initialized")
+    except Exception as e:
+        log.exception(f"DB init failed: {e}")
+
+@dataclass
+class User:
+    id: int
+    telegram_id: int
+    chat_id: int
+    first_name: Optional[str]
+    surname: Optional[str]
+    nickname: Optional[str]
+    email: Optional[str]
+    registered_at: Optional[datetime]
+    reg_step: int
+    state: Optional[str]
+    total_points: int
+    tests_count: int
+
+def get_or_create_user(telegram_id: int, chat_id: int) -> User:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+            row = cur.fetchone()
+            if row:
+                if row["chat_id"] != chat_id:
+                    cur.execute("UPDATE users SET chat_id=%s WHERE telegram_id=%s", (chat_id, telegram_id))
+                    conn.commit()
+                return User(**row)
+
+            cur.execute(
+                "INSERT INTO users (telegram_id, chat_id, reg_step) VALUES (%s, %s, 1) RETURNING *",
+                (telegram_id, chat_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return User(**row)
+
+def update_user_step(user_id: int, reg_step: int) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET reg_step=%s WHERE id=%s", (reg_step, user_id))
+        conn.commit()
+
+def set_user_state(user_id: int, state: Optional[str]) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET state=%s WHERE id=%s", (state, user_id))
+        conn.commit()
+
+def set_user_field(user_id: int, field: str, value: str) -> None:
+    if field not in ("first_name", "surname", "nickname", "email"):
+        raise ValueError("Invalid field")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE users SET {field}=%s WHERE id=%s", (value, user_id))
+        conn.commit()
+
+def finalize_registration(user_id: int) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET registered_at=now(), reg_step=0 WHERE id=%s",
+                (user_id,),
+            )
+        conn.commit()
+
+def add_test_score(user_id: int, score: int) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO tests (user_id, score) VALUES (%s, %s)", (user_id, score))
+            cur.execute(
+                "UPDATE users SET total_points = total_points + %s, tests_count = tests_count + 1 WHERE id=%s",
+                (score, user_id),
+            )
+        conn.commit()
+
+def fetch_user_stats(user_id: int) -> Dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT total_points, tests_count FROM users WHERE id=%s", (user_id,))
+            u = cur.fetchone()
+            cur.execute("SELECT COUNT(*) AS c FROM tests WHERE user_id=%s", (user_id,))
+            t = cur.fetchone()
+    return {
+        "total_points": int(u["total_points"]),
+        "tests_count": int(u["tests_count"]),
+        "tests_rows": int(t["c"]),
+    }
+
+def tz_bounds_for_today() -> Tuple[datetime, datetime]:
+    tz = ZoneInfo(TIMEZONE_NAME)
+    now_local = datetime.now(tz=tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    # convert to UTC for DB comparison (DB stores timestamptz)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+def daily_leaderboard(limit: int = 10) -> list[Dict[str, Any]]:
+    start_utc, end_utc = tz_bounds_for_today()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT u.telegram_id, u.first_name, u.surname, u.nickname,
+                       SUM(t.score)::bigint AS points,
+                       COUNT(*)::int AS tests
+                FROM tests t
+                JOIN users u ON u.id = t.user_id
+                WHERE t.created_at >= %s AND t.created_at < %s
+                GROUP BY u.telegram_id, u.first_name, u.surname, u.nickname
+                ORDER BY points DESC, tests DESC
+                LIMIT %s
+                """,
+                (start_utc, end_utc, limit),
+            )
+            return list(cur.fetchall())
+
+def lifetime_leaderboard(limit: int = 10) -> list[Dict[str, Any]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT telegram_id, first_name, surname, nickname,
+                       total_points AS points,
+                       tests_count AS tests
+                FROM users
+                WHERE registered_at IS NOT NULL
+                ORDER BY total_points DESC, tests_count DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return list(cur.fetchall())
+
+
+# -----------------------------
+# Registration + Menu logic
+# -----------------------------
+def registration_prompt(step: int) -> str:
+    return {
+        1: "Welcome! Let’s register you.\n\n1/4 — What is your *name*?",
+        2: "2/4 — What is your *surname*?",
+        3: "3/4 — What is your *nickname* (display name)?",
+        4: "4/4 — What is your *email address*?",
+    }.get(step, "Registration step error.")
+
+def handle_registration(user: User, chat_id: int, incoming: str) -> None:
+    # If user just started (no answer yet), ask question
+    if user.reg_step in (1, 2, 3, 4) and not incoming:
+        send_message(chat_id, registration_prompt(user.reg_step), reply_markup=remove_keyboard())
+        return
+
+    text = incoming.strip()
+
+    if user.reg_step == 1:
+        set_user_field(user.id, "first_name", text)
+        update_user_step(user.id, 2)
+        send_message(chat_id, registration_prompt(2), reply_markup=remove_keyboard())
+        return
+
+    if user.reg_step == 2:
+        set_user_field(user.id, "surname", text)
+        update_user_step(user.id, 3)
+        send_message(chat_id, registration_prompt(3), reply_markup=remove_keyboard())
+        return
+
+    if user.reg_step == 3:
+        set_user_field(user.id, "nickname", text)
+        update_user_step(user.id, 4)
+        send_message(chat_id, registration_prompt(4), reply_markup=remove_keyboard())
+        return
+
+    if user.reg_step == 4:
+        if not EMAIL_RE.match(text):
+            send_message(chat_id, "That email doesn’t look valid. Please enter a real email (like name@example.com).")
+            return
+        set_user_field(user.id, "email", text)
+        finalize_registration(user.id)
+        send_message(
+            chat_id,
+            "✅ Registration complete!\n\nUse the menu buttons below.",
+            reply_markup=main_menu_keyboard(),
         )
-        out = (getattr(resp, "output_text", None) or "").strip()
-        return out or "No output from model."
+        return
 
-    # Older SDKs: Chat Completions API (supported indefinitely)
-    resp = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": TEACHER_STYLE_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
-        max_tokens=MAX_OUTPUT_TOKENS,
-        temperature=TEMPERATURE,
+def format_lb(rows: list[Dict[str, Any]], title: str) -> str:
+    if not rows:
+        return f"{title}\n\nNo results yet."
+    lines = [title, ""]
+    for i, r in enumerate(rows, start=1):
+        name = (r.get("nickname") or "").strip()
+        if not name:
+            name = f"{(r.get('first_name') or '').strip()} {(r.get('surname') or '').strip()}".strip()
+        pts = int(r.get("points") or 0)
+        tests = int(r.get("tests") or 0)
+        lines.append(f"{i}. {name} — {pts} pts ({tests} tests)")
+    return "\n".join(lines)
+
+def help_text() -> str:
+    return (
+        "Help Desk commands:\n\n"
+        "• 📝 Record Test Score — add your SAT test score\n"
+        "• 📊 My Stats — total points + tests written\n"
+        "• 🏆 Daily Leaderboard — points earned today\n"
+        "• 🏆 Lifetime Leaderboard — all-time points\n\n"
+        "Tip: You can always type /start to see the menu."
     )
-    return (resp.choices[0].message.content or "").strip() or "No output from model."
+
+
+# -----------------------------
+# Optional AI tutor (if you want it)
+# -----------------------------
+def ai_answer(question: str) -> str:
+    if not openai_client:
+        return "AI tutor is not enabled (missing OPENAI_API_KEY)."
+    resp = openai_client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": "You are an SAT tutor. Be clear and step-by-step."},
+            {"role": "user", "content": question},
+        ],
+        max_output_tokens=500,
+        temperature=0.3,
+        store=False,
+    )
+    return (getattr(resp, "output_text", None) or "").strip() or "No output."
 
 
 # -----------------------------
@@ -161,7 +389,7 @@ def sat_tutor_answer(user_text: str) -> str:
 # -----------------------------
 @app.get("/")
 def root():
-    return "SAT DM bot is running."
+    return "SAT Help Desk bot is running."
 
 @app.get("/health")
 def health():
@@ -169,10 +397,12 @@ def health():
 
 @app.post("/setup")
 def setup_webhook():
-    require_setup_auth()
+    token = (request.args.get("token") or request.headers.get("X-Setup-Token") or "").strip()
+    if not SETUP_TOKEN or not hmac.compare_digest(token, SETUP_TOKEN):
+        abort(401)
 
     if not WEBHOOK_BASE_URL:
-        return jsonify({"ok": False, "error": "WEBHOOK_BASE_URL (or RENDER_EXTERNAL_URL) is not set"}), 400
+        return jsonify({"ok": False, "error": "WEBHOOK_BASE_URL is not set"}), 400
 
     webhook_url = WEBHOOK_BASE_URL.rstrip("/") + "/webhook"
     payload: Dict[str, Any] = {
@@ -191,97 +421,107 @@ def webhook():
     verify_webhook_secret()
     req_id = str(uuid.uuid4())
 
-    global LAST_UPDATE, LAST_UPDATE_AT
     update = request.get_json(force=True, silent=False) or {}
-    LAST_UPDATE = update
-    LAST_UPDATE_AT = time.time()
-
     msg = extract_message(update)
     if not msg:
         return jsonify({"ok": True})
-
-    if is_bot_message(msg) or not is_private_chat(msg):
+    if not is_private_chat(msg) or (msg.get("from") or {}).get("is_bot"):
         return jsonify({"ok": True})
 
     chat_id = int((msg.get("chat") or {}).get("id"))
-    message_id = msg.get("message_id")
+    telegram_id = int((msg.get("from") or {}).get("id"))
+    incoming = text_or_caption(msg)
 
-    user_text = text_or_caption(msg)
-    if not user_text:
+    # Ensure user exists
+    user = get_or_create_user(telegram_id, chat_id)
+
+    # /start always shows either registration or menu
+    if incoming.lower().startswith("/start"):
+        if user.reg_step != 0 or user.registered_at is None:
+            handle_registration(user, chat_id, "")
+        else:
+            send_message(chat_id, "Welcome back. Choose an option:", reply_markup=main_menu_keyboard())
         return jsonify({"ok": True})
 
-    lower = user_text.lower().strip()
-
-    # /start + /help always respond
-    if lower.startswith("/start") or lower.startswith("/help"):
-        send_reply(
-            chat_id,
-            "Hi! Send me an SAT question.\n\n"
-            "You can type it normally, or use:\n"
-            "• /sat <question>\n\n"
-            "Example: /sat If 3x + 5 = 20, what is x?",
-            reply_to_message_id=message_id,
-        )
+    # If in registration flow, consume messages as registration answers
+    if user.reg_step != 0 or user.registered_at is None:
+        handle_registration(user, chat_id, incoming)
         return jsonify({"ok": True})
 
-    # If they used /sat, strip it
-    question = user_text
-    if lower.startswith("/sat"):
-        parts = user_text.split(maxsplit=1)
-        question = parts[1].strip() if len(parts) > 1 else ""
-        if not question:
-            send_reply(chat_id, "Send the question after /sat. Example: /sat If 3x+5=20, find x.", reply_to_message_id=message_id)
+    # Handle state: awaiting score input
+    if user.state == "awaiting_score":
+        text = incoming.strip()
+        if text.lower() in ("/cancel", "cancel"):
+            set_user_state(user.id, None)
+            send_message(chat_id, "Cancelled.", reply_markup=main_menu_keyboard())
+            return jsonify({"ok": True})
+        try:
+            score = int(text)
+            if score < 0 or score > 1600:
+                raise ValueError("out of range")
+        except Exception:
+            send_message(chat_id, "Please enter a number between 0 and 1600 (or /cancel).")
             return jsonify({"ok": True})
 
-    # Call OpenAI (and NEVER be silent if it fails)
-    try:
-        answer = sat_tutor_answer(question)
-        send_reply(chat_id, answer, reply_to_message_id=message_id)
-    except Exception as e:
-        global LAST_ERROR, LAST_ERROR_AT
-        LAST_ERROR_AT = time.time()
-        LAST_ERROR = {"req_id": req_id, "error": repr(e)}
-
-        log.exception(f"[{req_id}] OpenAI/handler error: {e}")
-        send_reply(
+        add_test_score(user.id, score)
+        set_user_state(user.id, None)
+        stats = fetch_user_stats(user.id)
+        send_message(
             chat_id,
-            f"⚠️ AI error (req {req_id}).\n"
-            f"Most common causes: missing OPENAI_API_KEY, wrong OPENAI_MODEL, or OpenAI request failing.\n"
-            f"Check Render logs + /debug/last_error.",
-            reply_to_message_id=message_id
+            f"✅ Saved: {score} points.\n"
+            f"Total points: {stats['total_points']}\n"
+            f"Tests written: {stats['tests_count']}",
+            reply_markup=main_menu_keyboard(),
         )
+        return jsonify({"ok": True})
+
+    # Menu actions (buttons are just text messages)
+    text = incoming.strip()
+
+    if text == "📝 Record Test Score":
+        set_user_state(user.id, "awaiting_score")
+        send_message(chat_id, "Send your SAT score (0–1600). Type /cancel to stop.")
+        return jsonify({"ok": True})
+
+    if text == "📊 My Stats":
+        stats = fetch_user_stats(user.id)
+        send_message(
+            chat_id,
+            f"📊 My Stats\n\n"
+            f"Total points: {stats['total_points']}\n"
+            f"Tests written: {stats['tests_count']}",
+            reply_markup=main_menu_keyboard(),
+        )
+        return jsonify({"ok": True})
+
+    if text == "🏆 Daily Leaderboard":
+        rows = daily_leaderboard(10)
+        start_utc, _ = tz_bounds_for_today()
+        send_message(chat_id, format_lb(rows, f"🏆 Daily Leaderboard ({TIMEZONE_NAME})\nDay starts at {start_utc.astimezone(ZoneInfo(TIMEZONE_NAME)).strftime('%H:%M')}"), reply_markup=main_menu_keyboard())
+        return jsonify({"ok": True})
+
+    if text == "🏆 Lifetime Leaderboard":
+        rows = lifetime_leaderboard(10)
+        send_message(chat_id, format_lb(rows, "🏆 Lifetime Leaderboard"), reply_markup=main_menu_keyboard())
+        return jsonify({"ok": True})
+
+    if text == "❓ Help" or text.lower().startswith("/help"):
+        send_message(chat_id, help_text(), reply_markup=main_menu_keyboard())
+        return jsonify({"ok": True})
+
+    # Optional: treat any other message as an SAT question to the AI tutor
+    # If you don't want AI at all, delete this block.
+    if openai_client:
+        thinking_id = send_message(chat_id, THINKING_TEXT)
+        try:
+            answer = ai_answer(text)
+            send_message(chat_id, answer, reply_markup=main_menu_keyboard())
+        except Exception as e:
+            log.exception(f"[{req_id}] AI error: {e}")
+            send_message(chat_id, f"⚠️ AI error. Check API quota/billing. (req {req_id})", reply_markup=main_menu_keyboard())
+        finally:
+            delete_message(chat_id, thinking_id)
+    else:
+        send_message(chat_id, "Use the menu buttons to record scores and view leaderboards.", reply_markup=main_menu_keyboard())
 
     return jsonify({"ok": True})
-
-
-# -----------------------------
-# Debug endpoints (protected)
-# -----------------------------
-@app.get("/debug/webhookinfo")
-def debug_webhookinfo():
-    require_debug_auth()
-    return jsonify(tg_get("getWebhookInfo"))
-
-@app.get("/debug/last_update")
-def debug_last_update():
-    require_debug_auth()
-    return jsonify({"last_update_at": LAST_UPDATE_AT, "last_update": LAST_UPDATE})
-
-@app.get("/debug/last_error")
-def debug_last_error():
-    require_debug_auth()
-    return jsonify({"last_error_at": LAST_ERROR_AT, "last_error": LAST_ERROR})
-
-@app.post("/debug/test_openai")
-def debug_test_openai():
-    require_debug_auth()
-    try:
-        out = sat_tutor_answer("Solve: If 3x + 5 = 20, what is x?")
-        return jsonify({"ok": True, "model": OPENAI_MODEL, "sample": out})
-    except Exception as e:
-        return jsonify({"ok": False, "error": repr(e), "model": OPENAI_MODEL}), 500
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
