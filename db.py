@@ -246,16 +246,13 @@ def set_user_fields(user_id: int, updates: Dict[str, Any]) -> None:
         conn.commit()
 
 def approve_user_by_telegram_id(tg_id: int, approved: bool) -> Optional[User]:
-    # hard-finish registration to avoid state desync
     with db() as conn:
         with conn.cursor() as cur:
+            # ✅ Only set approved flag; DO NOT touch reg_step here
             cur.execute(
                 """
                 UPDATE users
-                SET approved=%s,
-                    reg_step=0,
-                    state=NULL,
-                    registered_at = COALESCE(registered_at, now())
+                SET approved=%s
                 WHERE telegram_id=%s
                 RETURNING *
                 """,
