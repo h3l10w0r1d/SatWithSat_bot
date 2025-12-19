@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Set
 from zoneinfo import ZoneInfo
 
@@ -10,20 +11,39 @@ TELEGRAM_WEBHOOK_SECRET = (os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").stri
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 TIMEZONE_NAME = (os.environ.get("TIMEZONE") or "UTC").strip()
 
-ADMIN_TELEGRAM_IDS_RAW = (os.environ.get("ADMIN_TELEGRAM_IDS") or "").strip()  # "123,456"
-DISABLE_SCHEDULER = (os.environ.get("DISABLE_SCHEDULER") or "").strip() == "1"
+# Admins: supports "123,456" OR "[123,456]"
+ADMIN_TELEGRAM_IDS_RAW = (os.environ.get("ADMIN_TELEGRAM_IDS") or "").strip()
 
 # Optional SAT AI tutor
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini").strip()
 
+# Scheduler switch
+DISABLE_SCHEDULER = (os.environ.get("DISABLE_SCHEDULER") or "").strip() == "1"
+
+# Rules
 MAX_DAILY_TESTS = 6
 COOLDOWN_MINUTES = 30
-SAVER_EARN_THRESHOLD = 3  # streak saver earned when daily tests reach 3 (max 1/day)
+SAVER_EARN_THRESHOLD = 3  # earn 1 saver/day once you log 3 tests in a day
 
 def parse_admin_ids(raw: str) -> Set[int]:
+    raw = (raw or "").strip()
     out: Set[int] = set()
-    for part in (raw or "").split(","):
+    if not raw:
+        return out
+
+    # JSON list
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            arr = json.loads(raw)
+            for x in arr:
+                out.add(int(x))
+            return out
+        except Exception:
+            pass
+
+    # Comma-separated
+    for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
