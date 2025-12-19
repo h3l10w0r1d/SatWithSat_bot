@@ -3,13 +3,23 @@ from psycopg.rows import dict_row
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta, date
 from typing import Any, Dict, Optional, Tuple, List
-from config import DATABASE_URL, ADMIN_IDS, TIMEZONE_NAME, MAX_DAILY_TESTS, COOLDOWN_MINUTES
 from zoneinfo import ZoneInfo
+
+from config import (
+    DATABASE_URL,
+    ADMIN_IDS,
+    TIMEZONE_NAME,
+    MAX_DAILY_TESTS,
+    COOLDOWN_MINUTES,
+)
 
 def db():
     if not DATABASE_URL:
         raise RuntimeError("Missing DATABASE_URL")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+def is_admin(tg_id: int) -> bool:
+    return tg_id in ADMIN_IDS
 
 def init_db() -> None:
     with db() as conn:
@@ -51,7 +61,15 @@ def init_db() -> None:
             );
             """)
 
-            # migrations (safe)
+            # dedup telegram updates
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_updates (
+              update_id BIGINT PRIMARY KEY,
+              processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """)
+
+            # safe migrations
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_math SMALLINT;")
@@ -61,13 +79,14 @@ def init_db() -> None:
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pref_minute SMALLINT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_savers INTEGER NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS saver_awarded_date DATE;")
+
             cur.execute("ALTER TABLE tests ADD COLUMN IF NOT EXISTS math_score SMALLINT;")
             cur.execute("ALTER TABLE tests ADD COLUMN IF NOT EXISTS created_by_admin BIGINT;")
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tests_user_created ON tests(user_id, created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tests_created_at ON tests(created_at);")
 
-            # legacy schema cleanup: tests.score NOT NULL, old rows missing math_score
+            # legacy schema cleanup: if tests.score existed
             cur.execute("""
             DO $$
             BEGIN
@@ -89,6 +108,21 @@ def init_db() -> None:
             """)
 
         conn.commit()
+
+def mark_update_processed(update_id: int) -> bool:
+    """
+    Returns True if newly inserted (process it),
+    False if already processed (skip).
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("INSERT INTO processed_updates(update_id) VALUES (%s)", (update_id,))
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                return False
 
 @dataclass
 class User:
@@ -139,9 +173,6 @@ def row_to_user(row: Dict[str, Any]) -> User:
         saver_awarded_date=row.get("saver_awarded_date"),
     )
 
-def is_admin(tg_id: int) -> bool:
-    return tg_id in ADMIN_IDS
-
 def get_user_by_tg(tg_id: int) -> Optional[User]:
     with db() as conn:
         with conn.cursor() as cur:
@@ -154,6 +185,7 @@ def get_or_create_user(telegram_id: int, chat_id: int) -> User:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE telegram_id=%s", (telegram_id,))
             row = cur.fetchone()
+
             if row:
                 if int(row["chat_id"]) != chat_id:
                     cur.execute("UPDATE users SET chat_id=%s WHERE telegram_id=%s", (chat_id, telegram_id))
@@ -161,13 +193,9 @@ def get_or_create_user(telegram_id: int, chat_id: int) -> User:
                     cur.execute("SELECT * FROM users WHERE telegram_id=%s", (telegram_id,))
                     row = cur.fetchone()
 
-                # auto-approve admins + finalize reg
+                # auto-set approved for admin IDs, but DO NOT change reg_step mid-registration
                 if is_admin(telegram_id) and not bool(row.get("approved")):
-                    cur.execute("""
-                        UPDATE users
-                        SET approved=TRUE, reg_step=0, state=NULL, registered_at=COALESCE(registered_at, now())
-                        WHERE telegram_id=%s
-                    """, (telegram_id,))
+                    cur.execute("UPDATE users SET approved=TRUE WHERE telegram_id=%s", (telegram_id,))
                     conn.commit()
                     cur.execute("SELECT * FROM users WHERE telegram_id=%s", (telegram_id,))
                     row = cur.fetchone()
@@ -191,18 +219,34 @@ def set_user_fields(user_id: int, updates: Dict[str, Any]) -> None:
         "streak_savers", "saver_awarded_date", "registered_at",
         "chat_id"
     }
-    keys = [k for k in updates.keys() if k in allowed]
-    if not keys:
-        return
-    sets = ", ".join([f"{k}=%s" for k in keys])
-    vals = [updates[k] for k in keys] + [user_id]
+
+    # handle increments: {"streak_savers": ("__INC__", 1)}
+    inc_updates: Dict[str, int] = {}
+    normal_updates: Dict[str, Any] = {}
+
+    for k, v in updates.items():
+        if k not in allowed:
+            continue
+        if isinstance(v, tuple) and len(v) == 2 and v[0] == "__INC__":
+            inc_updates[k] = int(v[1])
+        else:
+            normal_updates[k] = v
+
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE users SET {sets} WHERE id=%s", vals)
+            for k, inc in inc_updates.items():
+                cur.execute(f"UPDATE users SET {k} = COALESCE({k},0) + %s WHERE id=%s", (inc, user_id))
+
+            if normal_updates:
+                keys = list(normal_updates.keys())
+                sets = ", ".join([f"{k}=%s" for k in keys])
+                vals = [normal_updates[k] for k in keys] + [user_id]
+                cur.execute(f"UPDATE users SET {sets} WHERE id=%s", vals)
+
         conn.commit()
 
 def approve_user_by_telegram_id(tg_id: int, approved: bool) -> Optional[User]:
-    # IMPORTANT: force-finish registration to prevent step desync
+    # hard-finish registration to avoid state desync
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -276,7 +320,6 @@ def can_add_test(user_id: int) -> Tuple[bool, str]:
     return True, "OK"
 
 def update_preferred_time(user_id: int) -> None:
-    # avg of last 10 test times (local)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -291,6 +334,7 @@ def update_preferred_time(user_id: int) -> None:
                 (TIMEZONE_NAME, TIMEZONE_NAME, user_id),
             )
             rows = cur.fetchall()
+
     if not rows:
         return
     hs = [r["h"] for r in rows if r.get("h") is not None]
