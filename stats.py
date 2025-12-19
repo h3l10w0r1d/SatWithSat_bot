@@ -1,6 +1,7 @@
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+
 from config import TIMEZONE_NAME, SAVER_EARN_THRESHOLD
 from db import db, tests_today_count, tz_bounds_for_today, set_user_fields
 
@@ -21,26 +22,26 @@ def fetch_user_stats(user_id: int) -> Dict[str, Any]:
             cur.execute("SELECT total_points, tests_count, goal_math, streak_savers FROM users WHERE id=%s", (user_id,))
             u = cur.fetchone()
 
-            cur.execute("SELECT MAX(math_score)::int AS best FROM tests WHERE user_id=%s AND math_score IS NOT NULL", (user_id,))
+            cur.execute("SELECT MAX(math_score)::int AS best FROM tests WHERE user_id=%s", (user_id,))
             best = (cur.fetchone() or {}).get("best")
 
             cur.execute(
-                "SELECT math_score::int AS s, created_at FROM tests WHERE user_id=%s AND math_score IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                "SELECT math_score::int AS s, created_at FROM tests WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
                 (user_id,),
             )
             last = cur.fetchone()
 
-            cur.execute("SELECT AVG(math_score)::float AS avg FROM tests WHERE user_id=%s AND math_score IS NOT NULL", (user_id,))
+            cur.execute("SELECT AVG(math_score)::float AS avg FROM tests WHERE user_id=%s", (user_id,))
             avg = (cur.fetchone() or {}).get("avg")
 
             cur.execute(
-                "SELECT math_score::int AS s, created_at FROM tests WHERE user_id=%s AND math_score IS NOT NULL ORDER BY created_at DESC LIMIT 60",
+                "SELECT math_score::int AS s, created_at FROM tests WHERE user_id=%s ORDER BY created_at DESC LIMIT 60",
                 (user_id,),
             )
             history = cur.fetchall()
 
             cur.execute(
-                "SELECT math_score::int AS s FROM tests WHERE user_id=%s AND math_score IS NOT NULL ORDER BY created_at DESC LIMIT 12",
+                "SELECT math_score::int AS s FROM tests WHERE user_id=%s ORDER BY created_at DESC LIMIT 12",
                 (user_id,),
             )
             rows = cur.fetchall()
@@ -55,7 +56,7 @@ def fetch_user_stats(user_id: int) -> Dict[str, Any]:
         "last": {"score": int(last["s"]), "at": last["created_at"]} if last else None,
         "avg": float(avg) if avg is not None else None,
         "last12": list(reversed(last12)),
-        "history": history,  # newest first
+        "history": history,
     }
 
 def time_of_day_effectiveness(user_id: int) -> str:
@@ -86,7 +87,7 @@ def estimate_goal(history: List[Dict[str, Any]], goal: int) -> str:
 
     tz = ZoneInfo(TIMEZONE_NAME)
     points = []
-    for r in reversed(history[:30]):  # oldest first
+    for r in reversed(history[:30]):
         s = r.get("s")
         at = r.get("created_at")
         if s is None or at is None:
