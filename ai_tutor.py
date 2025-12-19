@@ -11,13 +11,10 @@ def sat_answer(question: str) -> str:
     payload = {
         "model": OPENAI_MODEL,
         "input": [
-            {
-                "role": "system",
-                "content": "You are an SAT math tutor. Explain clearly, step-by-step, and give the final answer."
-            },
+            {"role": "system", "content": "You are an SAT math tutor. Explain clearly step-by-step and give a final answer."},
             {"role": "user", "content": question},
         ],
-        "max_output_tokens": 500,
+        "max_output_tokens": 600,
         "store": False,
     }
 
@@ -30,11 +27,9 @@ def sat_answer(question: str) -> str:
         return f"⚠️ AI error: {j.get('error', {}).get('message', 'unknown')}"
 
     j = r.json()
-    # Responses API: output_text is easiest if present
     if "output_text" in j and j["output_text"]:
         return j["output_text"].strip()
 
-    # fallback: try to extract
     out = []
     for item in j.get("output", []):
         for c in item.get("content", []):
