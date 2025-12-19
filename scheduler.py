@@ -1,6 +1,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
 from config import TIMEZONE_NAME, DISABLE_SCHEDULER
 from telegram_client import send_message, main_menu_keyboard
 from db import db, tests_today_count, set_user_fields
@@ -59,7 +60,7 @@ def notification_tick() -> None:
 
         try:
             send_message(int(u["chat_id"]), msg, reply_markup=main_menu_keyboard())
-            set_user_fields(uid, {"last_nudge_at": datetime.now(tz=ZoneInfo("UTC"))})
+            set_user_fields(uid, {"last_nudge_at": datetime.now(timezone.utc)})
         except Exception:
             pass
 
