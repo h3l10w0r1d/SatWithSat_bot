@@ -368,7 +368,18 @@ def find_user_by_tg(tg_id: int) -> Optional[User]:
 def approve_user_by_telegram_id(tg_id: int, approved: bool) -> Optional[User]:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET approved=%s WHERE telegram_id=%s RETURNING *", (approved, tg_id))
+            cur.execute(
+                """
+                UPDATE users
+                SET approved=%s,
+                    reg_step=0,
+                    state=NULL,
+                    registered_at = COALESCE(registered_at, now())
+                WHERE telegram_id=%s
+                RETURNING *
+                """,
+                (approved, tg_id),
+            )
             row = cur.fetchone()
         conn.commit()
     return row_to_user(row) if row else None
