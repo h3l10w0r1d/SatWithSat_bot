@@ -381,14 +381,26 @@ def fetch_user_stats(user: User) -> Dict[str, Any]:
         with conn.cursor() as cur:
             cur.execute("SELECT total_points, tests_count, goal_math FROM users WHERE id=%s", (user.id,))
             u = cur.fetchone()
-            cur.execute("SELECT MAX(math_score)::int AS best FROM tests WHERE user_id=%s", (user.id,))
-            best = cur.fetchone()["best"]
-            cur.execute("SELECT math_score::int AS s, created_at FROM tests WHERE user_id=%s ORDER BY created_at DESC LIMIT 1", (user.id,))
+
+            cur.execute("SELECT MAX(math_score)::int AS best FROM tests WHERE user_id=%s AND math_score IS NOT NULL", (user.id,))
+            best = (cur.fetchone() or {}).get("best")
+
+            cur.execute(
+                "SELECT math_score::int AS s, created_at FROM tests WHERE user_id=%s AND math_score IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (user.id,),
+            )
             last = cur.fetchone()
-            cur.execute("SELECT AVG(math_score)::float AS avg FROM tests WHERE user_id=%s", (user.id,))
-            avg = cur.fetchone()["avg"]
-            cur.execute("SELECT math_score::int AS s FROM tests WHERE user_id=%s ORDER BY created_at DESC LIMIT 12", (user.id,))
-            last12 = [int(r["s"]) for r in cur.fetchall()]
+
+            cur.execute("SELECT AVG(math_score)::float AS avg FROM tests WHERE user_id=%s AND math_score IS NOT NULL", (user.id,))
+            avg = (cur.fetchone() or {}).get("avg")
+
+            cur.execute(
+                "SELECT math_score::int AS s FROM tests WHERE user_id=%s AND math_score IS NOT NULL ORDER BY created_at DESC LIMIT 12",
+                (user.id,),
+            )
+            last12_rows = cur.fetchall()
+            last12 = [int(r["s"]) for r in last12_rows if r.get("s") is not None]
+
     return {
         "total_points": int(u["total_points"]),
         "tests_count": int(u["tests_count"]),
@@ -396,7 +408,7 @@ def fetch_user_stats(user: User) -> Dict[str, Any]:
         "best": int(best) if best is not None else None,
         "last": {"score": int(last["s"]), "at": last["created_at"]} if last else None,
         "avg": float(avg) if avg is not None else None,
-        "last12": list(reversed(last12)),
+        "last12": last12,
     }
 
 def streak_days(user: User) -> int:
