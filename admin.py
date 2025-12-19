@@ -208,7 +208,7 @@ def broadcast_to_all(text: str) -> int:
             sent += 1
         except Exception:
             pass
-    return sentimport io, csv
+    return sent
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from telegram_client import send_message, send_document, inline_kb, main_menu_keyboard
